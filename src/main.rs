@@ -99,12 +99,7 @@ async fn update_url_status(url: &str, pool: &Pool, status: &mut UrlStatus) -> Op
         Err(e) => UrlStatus::Error(e.to_string()),
     };
     let optional_text = if *status != new_status {
-        let text = format!(
-            "Response changed!\n{} {} [{}]",
-            new_status.as_emoji(),
-            url,
-            new_status
-        );
+        let text = format!("{} {} [{}]", new_status.as_emoji(), url, new_status);
         Some(text)
     } else {
         None
@@ -193,7 +188,9 @@ async fn update_url_states_and_notify_users(pool: &Pool) -> Result<(), Error> {
             .filter_map(future::ready)
             .chunks(10)
             .for_each(|mut updates| {
-                let text = updates.drain(..).fold(String::new(), |s, elem| s + &elem);
+                let text = updates
+                    .drain(..)
+                    .fold(String::from("Response changed:\n"), |s, elem| s + &elem);
                 let message = SendMessage::new(user, text);
                 pool.api.send(message).map(|_| ())
             })
