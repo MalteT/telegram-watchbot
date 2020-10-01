@@ -1,6 +1,6 @@
 #![feature(async_closure)]
 
-use futures::StreamExt;
+use futures::{future, stream::FuturesUnordered, FutureExt, StreamExt};
 use reqwest::{Client, ClientBuilder, Error as ReqwestError, StatusCode};
 use rustbreak::{deser::Ron, FileDatabase, RustbreakError};
 use serde::{Deserialize, Serialize};
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Error> {
     while let Some(event) = events.next().await {
         match event {
             WakerOrUpdate::Waker(_) => {
-                match update_url_states(&pool).await {
+                match update_url_states_and_notify_users(&pool).await {
                     Ok(()) => println!("Updated URLs successfully"),
                     Err(e) => println!("{}", e),
                 }
@@ -89,27 +89,28 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn check_url(user: &UserId, url: &str, api: &Api, old_status: &UrlStatus) -> UrlStatus {
+async fn update_url_status(url: &str, pool: &Pool, status: &mut UrlStatus) -> Option<String> {
     println!("  Checking {}", url);
-    let url_status = match reqwest::get(url).await {
+    let new_status = match pool.client.head(url).send().await {
         Ok(response) => {
             let status = response.status();
             UrlStatus::Code(status.as_u16())
         }
         Err(e) => UrlStatus::Error(e.to_string()),
     };
-    if *old_status != url_status {
+    let optional_text = if *status != new_status {
         let text = format!(
-            "Response changed!\n{} {}\nStatus: {}",
-            url_status.as_emoji(),
+            "Response changed!\n{} {} [{}]",
+            new_status.as_emoji(),
             url,
-            url_status
+            new_status
         );
-        let message = SendMessage::new(user, text);
-        api.send(message).await.ok();
-    }
-
-    url_status
+        Some(text)
+    } else {
+        None
+    };
+    *status = new_status;
+    optional_text
 }
 
 async fn handle_telegram_update(
@@ -132,9 +133,7 @@ async fn handle_telegram_update(
                 send_help_to_user(&message.from.id, pool).await?;
             } else {
                 pool.api
-                    .send(
-                        message.text_reply("Come again? 🤷‍♀️\nTry to /add your_url!"),
-                    )
+                    .send(message.text_reply("Come again? 🤷‍♀️\nTry to /add your_url!"))
                     .await?;
             }
         }
@@ -179,12 +178,26 @@ async fn add_url_from(url: &str, message: &Message, pool: &Pool) -> Result<(), E
     Ok(())
 }
 
-async fn update_url_states(pool: &Pool) -> Result<(), Error> {
+async fn update_url_states_and_notify_users(pool: &Pool) -> Result<(), Error> {
     let mut list = pool.db.borrow_data_mut()?;
+    // Iterate over all users
     for (user, watchlist) in &mut *list {
-        for (url, status) in watchlist {
-            *status = check_url(user, url, &pool.api.clone(), &status).await;
-        }
+        // Assemble a stream of requests
+        let updates: FuturesUnordered<_> = watchlist
+            .iter_mut()
+            .map(|(url, ref mut status)| update_url_status(url, pool, status))
+            .collect();
+        // Filter all updates that returned None and chunk the rest into eadible pieces.
+        // Then inform the user about the updates
+        updates
+            .filter_map(future::ready)
+            .chunks(10)
+            .for_each(|mut updates| {
+                let text = updates.drain(..).fold(String::new(), |s, elem| s + &elem);
+                let message = SendMessage::new(user, text);
+                pool.api.send(message).map(|_| ())
+            })
+            .await;
     }
 
     Ok(())
