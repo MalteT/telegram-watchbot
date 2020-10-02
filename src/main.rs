@@ -11,16 +11,27 @@ use telegram_bot::{
 use thiserror::Error;
 use tokio::time::Instant;
 
-use std::collections::HashMap;
-use std::env;
-use std::fmt;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    env, fmt,
+    time::Duration,
+};
 
-type DBData = HashMap<UserId, Vec<(String, UrlStatus)>>;
+/// The type for the data that is stored in the database.
+type DBData = HashMap<String, (UrlStatus, HashSet<UserId>)>;
+/// The database type itself for easy reference.
 type DB = FileDatabase<DBData, Ron>;
 
+/// Time to wait for the HEAD requests to finish.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Time between checking the urls.
+const TIME_BETWEEN_UPDATES: Duration = Duration::from_secs(120);
+
+/// Either type to merge the different streams
 pub enum WakerOrUpdate {
+    /// [`Instant`] from the [`tokio::time::interval`] stream.
     Waker(Instant),
+    /// Update from the Telegram bot api stream.
     TelegramUpdate(Result<Update, TelegramError>),
 }
 
@@ -34,17 +45,24 @@ pub enum Error {
     Database(#[source] RustbreakError),
 }
 
+/// Status of a URL.
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum UrlStatus {
+    /// The request returned some response code.
     Code(u16),
+    /// The connection errored.
     Error(String),
+    /// The status is yet to be checked.
     Unknown,
 }
 
 /// Collection of all important states
 pub struct Pool {
+    /// Telegram bot api
     pub api: Api,
+    /// Database connection
     pub db: DB,
+    /// request client
     pub client: Client,
 }
 
@@ -57,13 +75,13 @@ async fn main() -> Result<(), Error> {
     // Open the database
     let db = DB::load_from_path_or_default(db_path).expect("Database loading failed");
 
-    // Initialize things
+    // Initialize everything
     let api = Api::new(token);
     let telegram_update_stream = api.stream().map(WakerOrUpdate::TelegramUpdate);
-    let ping_waker = tokio::time::interval(Duration::from_secs(60)).map(WakerOrUpdate::Waker);
+    let ping_waker = tokio::time::interval(TIME_BETWEEN_UPDATES).map(WakerOrUpdate::Waker);
     let mut events = futures::stream::select(telegram_update_stream, ping_waker);
     let client = ClientBuilder::new()
-        .timeout(Duration::from_secs(10))
+        .timeout(CONNECTION_TIMEOUT)
         .build()
         .expect("infallible");
     let pool = Pool { api, db, client };
@@ -89,8 +107,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn update_url_status(url: &str, pool: &Pool, status: &mut UrlStatus) -> Option<String> {
-    println!("  Checking {}", url);
+async fn update_url_state(url: &str, pool: &Pool, status: &mut UrlStatus) -> Option<String> {
     let new_status = match pool.client.head(url).send().await {
         Ok(response) => {
             let status = response.status();
@@ -99,7 +116,8 @@ async fn update_url_status(url: &str, pool: &Pool, status: &mut UrlStatus) -> Op
         Err(e) => UrlStatus::Error(e.to_string()),
     };
     let optional_text = if *status != new_status {
-        let text = format!("{} {} [{}]", new_status.as_emoji(), url, new_status);
+        println!("URL '{}' changed to '{}'", url, new_status);
+        let text = format!("{} {} [{}]\n", new_status.as_emoji(), url, new_status);
         Some(text)
     } else {
         None
@@ -145,15 +163,19 @@ async fn send_help_to_user(user: &UserId, pool: &Pool) -> Result<(), Error> {
 }
 
 async fn list_urls_by_user(user: &UserId, pool: &Pool) -> Result<(), Error> {
-    let text = pool.db.read(|list| {
-        if let Some(urls) = list.get(user) {
-            urls.iter()
-                .map(|(url, status)| format!("{} {} [{}]\n", status.as_emoji(), url, status))
-                .fold(String::new(), |s, item| s + &item)
-        } else {
-            "Poor fella.. 🤷‍♀️ You should /add some_url!".to_owned()
-        }
+    let mut text = pool.db.read(|url_map| {
+        url_map
+            .iter()
+            // Select all urls of the user
+            .filter(|(_, (_, userids))| userids.contains(user))
+            // Format the status
+            .map(|(url, (status, _))| format!("{} {} [{}]\n", status.as_emoji(), url, status))
+            // Collect it into one message
+            .fold(String::new(), |s, item| s + &item)
     })?;
+    if text.is_empty() {
+        text = "Poor fella... Try /add some_url!".into();
+    }
     let message = SendMessage::new(user, text);
     pool.api.send(message).await.ok();
 
@@ -161,9 +183,12 @@ async fn list_urls_by_user(user: &UserId, pool: &Pool) -> Result<(), Error> {
 }
 
 async fn add_url_from(url: &str, message: &Message, pool: &Pool) -> Result<(), Error> {
-    let db_update_result = pool.db.write(|list| {
-        let urls = list.entry(message.from.id).or_default();
-        urls.push((url.into(), UrlStatus::Unknown));
+    let db_update_result = pool.db.write(|url_map| {
+        url_map
+            .entry(url.into())
+            .or_insert((UrlStatus::Unknown, HashSet::new()))
+            .1
+            .insert(message.from.id);
     });
     if db_update_result.is_ok() {
         pool.api
@@ -174,29 +199,26 @@ async fn add_url_from(url: &str, message: &Message, pool: &Pool) -> Result<(), E
 }
 
 async fn update_url_states_and_notify_users(pool: &Pool) -> Result<(), Error> {
-    let mut list = pool.db.borrow_data_mut()?;
+    let mut url_map = pool.db.borrow_data_mut()?;
     // Iterate over all users
-    for (user, watchlist) in &mut *list {
-        // Assemble a stream of requests
-        let updates: FuturesUnordered<_> = watchlist
-            .iter_mut()
-            .map(|(url, ref mut status)| update_url_status(url, pool, status))
-            .collect();
-        // Filter all updates that returned None and chunk the rest into eadible pieces.
-        // Then inform the user about the updates
-        updates
-            .filter_map(future::ready)
-            .chunks(10)
-            .for_each(|mut updates| {
-                let text = updates
-                    .drain(..)
-                    .fold(String::from("Response changed:\n"), |s, elem| s + &elem);
-                let message = SendMessage::new(user, text);
-                pool.api.send(message).map(|_| ())
-            })
-            .await;
-    }
-
+    let updates: FuturesUnordered<_> = url_map
+        .iter_mut()
+        .map(|(url, (ref mut status, userids))| {
+            update_url_state(url, pool, status).map(|text| (text, userids))
+        })
+        .collect();
+    updates
+        .filter_map(|(optional_text, userids)| {
+            future::ready(optional_text.map(|text| (text, userids)))
+        })
+        .for_each(|(text, userids)| {
+            let send_responses = userids.iter().map(|userid| {
+                let message = SendMessage::new(userid, text.clone());
+                pool.api.send(message)
+            });
+            future::join_all(send_responses).map(|_| ())
+        })
+        .await;
     Ok(())
 }
 
