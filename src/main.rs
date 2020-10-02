@@ -117,7 +117,7 @@ async fn update_url_state(url: &str, pool: &Pool, status: &mut UrlStatus) -> Opt
     };
     let optional_text = if *status != new_status {
         println!("URL '{}' changed to '{}'", url, new_status);
-        let text = format!("{} {} [{}]\n", new_status.as_emoji(), url, new_status);
+        let text = format!("{} {} [{}]\n", new_status.as_emoji(), url, new_status.long_format());
         Some(text)
     } else {
         None
@@ -255,6 +255,16 @@ impl UrlStatus {
                 } else {
                     "🔥"
                 }
+            }
+        }
+    }
+    pub fn long_format(&self) -> String {
+        match self {
+            UrlStatus::Unknown => format!("???"),
+            UrlStatus::Error(e) => format!("Error: {}", e),
+            UrlStatus::Code(code) => {
+                let status = StatusCode::from_u16(*code).unwrap_or_default();
+                format!("{}", status)
             }
         }
     }
