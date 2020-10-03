@@ -117,7 +117,12 @@ async fn update_url_state(url: &str, pool: &Pool, status: &mut UrlStatus) -> Opt
     };
     let optional_text = if *status != new_status {
         println!("URL '{}' changed to '{}'", url, new_status);
-        let text = format!("{} {} [{}]\n", new_status.as_emoji(), url, new_status.long_format());
+        let text = format!(
+            "{} {} [{}]\n",
+            new_status.as_emoji(),
+            url,
+            new_status.long_format()
+        );
         Some(text)
     } else {
         None
@@ -140,6 +145,9 @@ async fn handle_telegram_update(
             if data.starts_with("/add ") {
                 let url = data.strip_prefix("/add ").expect("infallible").trim();
                 add_url_from(url, &message, pool).await?;
+            } else if data.starts_with("/del ") {
+                let url = data.strip_prefix("/del ").expect("infallible").trim();
+                delete_url_from(url, &message, pool).await?;
             } else if data.trim() == "/list" {
                 list_urls_by_user(&message.from.id, pool).await?;
             } else if data.trim() == "/help" || data.trim() == "/start" {
@@ -154,8 +162,27 @@ async fn handle_telegram_update(
     Ok(())
 }
 
+async fn delete_url_from(url: &str, message: &Message, pool: &Pool) -> Result<(), Error> {
+    let db_update_result = pool.db.write(|url_map| {
+        if let Some((_, ref mut userids)) = url_map.get_mut(url) {
+            userids.remove(&message.from.id)
+        } else {
+            false
+        }
+    });
+    if let Ok(actually_removed_user) = db_update_result {
+        let text = if actually_removed_user {
+            format!("{} removed successfully!", url)
+        } else {
+            format!("{} is not on your watchlist!🤦🏻‍♀️", url)
+        };
+        pool.api.send(message.text_reply(text)).await?;
+    }
+    Ok(())
+}
+
 async fn send_help_to_user(user: &UserId, pool: &Pool) -> Result<(), Error> {
-    let text = "Simple bot to notify you when your webpages go down\n/add URL to add a url to the watchlist\n/list to see your urls\n/help to see this help\n\n Have fun!";
+    let text = "Simple bot to notify you when your webpages go down\n/add URL to add a url to the watchlist,\n/list to see your urls,\n/del some_url to get rid of it and\n/help to see this help\n\n Have fun!";
     let message = SendMessage::new(user, text);
     pool.api.send(message).await.ok();
 
@@ -260,7 +287,7 @@ impl UrlStatus {
     }
     pub fn long_format(&self) -> String {
         match self {
-            UrlStatus::Unknown => format!("???"),
+            UrlStatus::Unknown => "???".to_string(),
             UrlStatus::Error(e) => format!("Error: {}", e),
             UrlStatus::Code(code) => {
                 let status = StatusCode::from_u16(*code).unwrap_or_default();
